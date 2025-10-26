@@ -1,10 +1,13 @@
 import os
 import re
 import logging
+import json
+import time as _t
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
+from tools import lookup_product_nutrition
 
 # ----- утилиты форматирования/санитайза -----
 CITATION_RE = re.compile(r"【[^】]*】")
@@ -40,12 +43,12 @@ log = logging.getLogger("tg-assistant-NutriMind")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Простое хранилище thread_id по chat_id (для демо в памяти процесса)
-THREADS = {}  # {chat_id: thread_id}
+THREADS: dict[int, str] = {}  # {chat_id: thread_id}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Привет! Я бот-помощник.\n"
-        "Отправь любое сообщение, и я передам его ассистенту OpenAI."
+        "👋 Привет! Я NutriMind.\n"
+        "Например: «Что приготовить на ужин без молочки?» или «Калорийность 100 г гречки?»"
     )
 
 def get_or_create_thread_id(chat_id: int) -> str:
@@ -56,13 +59,79 @@ def get_or_create_thread_id(chat_id: int) -> str:
     THREADS[chat_id] = thread.id
     return thread.id
 
+def run_and_wait(thread_id: str, assistant_id: str):
+    """
+    Запускает run и ждёт завершения, обрабатывая requires_action (tool-calls).
+    Возвращает финальный объект run.
+    """
+    run = client.beta.threads.runs.create(thread_id=thread_id, assistant_id=assistant_id)
+
+    while True:
+        run = client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run.id)
+
+        # Терминальные статусы
+        if run.status in ("completed", "failed", "cancelled", "expired"):
+            if run.status == "failed":
+                err = getattr(run, "last_error", None)
+                if err:
+                    log.error("Run failed: %s — %s", err.code, err.message)
+            return run
+
+        # Обработка инструментов (функций)
+        if run.status == "requires_action" and run.required_action and run.required_action.type == "submit_tool_outputs":
+            tool_outputs = []
+            tcs = run.required_action.submit_tool_outputs.tool_calls
+            log.info("Tool calls: %d", len(tcs))
+            for tc in tcs:
+                name = tc.function.name
+                args_raw = tc.function.arguments or "{}"
+                log.info("Tool call: %s args=%s", name, args_raw)
+
+                try:
+                    args = json.loads(args_raw)
+                except Exception:
+                    tool_outputs.append({
+                        "tool_call_id": tc.id,
+                        "output": json.dumps({"status": "error", "message": "invalid_json"}, ensure_ascii=False)
+                    })
+                    continue
+
+                if name == "lookup_product_nutrition":
+                    try:
+                        product = str(args["product"]).strip()
+                        payload = lookup_product_nutrition(product=product, per="100g")
+                        tool_outputs.append({
+                            "tool_call_id": tc.id,
+                            "output": json.dumps(payload, ensure_ascii=False)
+                        })
+                    except Exception as e:
+                        tool_outputs.append({
+                            "tool_call_id": tc.id,
+                            "output": json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False)
+                        })
+                else:
+                    tool_outputs.append({
+                        "tool_call_id": tc.id,
+                        "output": json.dumps({"status": "error", "message": f"Unknown function: {name}"}, ensure_ascii=False)
+                    })
+
+            run = client.beta.threads.runs.submit_tool_outputs(
+                thread_id=thread_id,
+                run_id=run.id,
+                tool_outputs=tool_outputs
+            )
+            continue
+
+        # Небольшая пауза, чтобы не крутить цикл слишком быстро
+        _t.sleep(0.35)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     user_text = update.message.text.strip()
     chat_id = update.effective_chat.id
 
-    status_msg = await update.message.reply_text("Обрабатываю запрос...")  # Сообщаем пользователю о процессе обработки
+    status_msg = await update.message.reply_text("Обрабатываю запрос...")
 
     # 1) Получаем/создаём thread для этого чата
     thread_id = get_or_create_thread_id(chat_id)
@@ -74,19 +143,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         content=user_text
     )
 
-    # 3) Запускаем Run ассистента и ждём завершения (create_and_poll)
-    run = client.beta.threads.runs.create_and_poll(
-        thread_id=thread_id,
-        assistant_id=ASSISTANT_ID,
-    )
+    # 3) Запускаем Run ассистента и ждём завершения (с обработкой функций)
+    run_and_wait(thread_id, ASSISTANT_ID)
 
     # 4) Достаём последние сообщения ассистента из Thread
-    messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=5)
-    # Ищем первый ответ ассистента
+    messages = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=10)
     reply_text = None
     for m in messages.data:
         if m.role == "assistant":
-            # Собираем текстовые части
             parts = []
             for c in m.content:
                 if c.type == "text":
@@ -98,9 +162,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not reply_text:
         reply_text = "Извини, не удалось получить ответ. Попробуй ещё раз."
 
-    # await update.message.reply_text(reply_text)
+    # 5) Санитайз + ответ в Telegram с parse_mode=Markdown
     clean = sanitize_markdown(reply_text)
-    await update.message.reply_text(
+    await status_msg.edit_text(
         clean,
         parse_mode="Markdown",
         disable_web_page_preview=True
