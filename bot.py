@@ -44,12 +44,33 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Простое хранилище thread_id по chat_id (для демо в памяти процесса)
 THREADS: dict[int, str] = {}  # {chat_id: thread_id}
+USER_HISTORY: dict[int, list[str]] = {}  # {chat_id: ["dish1", "dish2"]}
+USER_PREFERENCES: dict[int, str] = {}  # {chat_id: "без глютена, веган"}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я NutriMind.\n"
-        "Например: «Что приготовить на ужин без молочки?» или «Калорийность 100 г гречки?»"
+        "Например: «Что приготовить на ужин без молочки?» или «Калорийность 100 г гречки?»\n\n"
+        "Команды:\n"
+        "/my_preferences - посмотреть текущие предпочтения\n"
+        "/set_preferences <текст> - установить предпочтения"
     )
+
+async def my_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    preferences = USER_PREFERENCES.get(chat_id, "пока не заданы")
+    await update.message.reply_text(f"Ваши предпочтения: {preferences}")
+
+async def set_preferences(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("Пожалуйста, укажите ваши предпочтения после команды.\n"
+                                      "Пример: /set_preferences без глютена, веган")
+        return
+
+    preferences = " ".join(context.args)
+    USER_PREFERENCES[chat_id] = preferences
+    await update.message.reply_text(f"Ваши предпочтения обновлены: {preferences}")
 
 def get_or_create_thread_id(chat_id: int) -> str:
     """Создаём Thread один раз на чат и переиспользуем для контекста."""
@@ -136,11 +157,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Получаем/создаём thread для этого чата
     thread_id = get_or_create_thread_id(chat_id)
 
+    # Формируем сообщение с учётом истории и предпочтений
+    history = USER_HISTORY.get(chat_id, [])
+    preferences = USER_PREFERENCES.get(chat_id)
+
+    extra_prompt = ""
+    if preferences:
+        extra_prompt += f"\n\n(Мои предпочтения: {preferences})"
+    if history:
+        extra_prompt += "\n(Не предлагай снова: " + ", ".join(history) + ")"
+
     # 2) Добавляем сообщение пользователя в Thread
     client.beta.threads.messages.create(
         thread_id=thread_id,
         role="user",
-        content=user_text
+        content=user_text + extra_prompt
     )
 
     # 3) Запускаем Run ассистента и ждём завершения (с обработкой функций)
@@ -161,6 +192,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not reply_text:
         reply_text = "Извини, не удалось получить ответ. Попробуй ещё раз."
+    else:
+        # Простое извлечение названия блюда для истории (пока без сложных регэкспов)
+        match = re.search(r"🍴\s*\*(.*?)\*", reply_text)
+        if match:
+            dish_name = match.group(1).strip()
+            if chat_id not in USER_HISTORY:
+                USER_HISTORY[chat_id] = []
+            if dish_name not in USER_HISTORY[chat_id]:
+                USER_HISTORY[chat_id].append(dish_name)
+                # Ограничим историю, чтобы она не росла бесконечно
+                if len(USER_HISTORY[chat_id]) > 10:
+                    USER_HISTORY[chat_id].pop(0)
 
     # 5) Санитайз + ответ в Telegram с parse_mode=Markdown
     clean = sanitize_markdown(reply_text)
@@ -173,6 +216,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("my_preferences", my_preferences))
+    app.add_handler(CommandHandler("set_preferences", set_preferences))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Bot started.")
     app.run_polling()
